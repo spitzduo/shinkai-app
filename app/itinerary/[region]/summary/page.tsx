@@ -14,7 +14,7 @@ type Spot = {
   image?: string;
   lat?: number;
   lng?: number;
-  // regionZone?: string; // present on data, not required here
+  regionZone?: string; // ✅ add this so we don't need `any`
 };
 
 type ItineraryDay = { day: number; spots: (Spot & { duration: string })[] };
@@ -34,7 +34,8 @@ function mapSearchLink(spot: Spot) {
 function dayRouteLink(spots: Spot[]) {
   if (!spots.length) return '#';
   const hasLL = (s: Spot) => s.lat !== undefined && s.lng !== undefined;
-  const toQ = (s: Spot) => (hasLL(s) ? `${s.lat},${s.lng}` : [s.name, s.city].filter(Boolean).join(', '));
+  const toQ = (s: Spot) =>
+    hasLL(s) ? `${s.lat},${s.lng}` : [s.name, s.city].filter(Boolean).join(', ');
   const origin = toQ(spots[0]);
   const destination = toQ(spots[spots.length - 1]);
   const waypoints = spots.slice(1, -1).map(toQ).join('|');
@@ -44,7 +45,7 @@ function dayRouteLink(spots: Spot[]) {
     `destination=${enc(destination)}`,
     waypoints ? `waypoints=${enc(waypoints)}` : null,
     `travelmode=driving`,
-  ].filter(Boolean);
+  ].filter(Boolean) as string[];
   return `${base}&${parts.join('&')}`;
 }
 
@@ -67,7 +68,7 @@ function generateItinerary(spots: Spot[], days: number, includeThemePark: boolea
   // Group by zone → city
   const groupedByZone: Record<string, Record<string, Spot[]>> = {};
   for (const spot of nonThemeSpots) {
-    const zone = (spot as any).regionZone || spot.city || 'unknown';
+    const zone = spot.regionZone || spot.city || 'unknown'; // ✅ no `any`
     const city = spot.city || 'unknown';
     (groupedByZone[zone] ||= {});
     (groupedByZone[zone][city] ||= []).push(spot);
@@ -104,7 +105,8 @@ function generateItinerary(spots: Spot[], days: number, includeThemePark: boolea
   for (const zone of Object.values(groupedByZone)) {
     for (const citySpots of Object.values(zone)) {
       const sorted = citySpots.sort((a, b) => {
-        const score = (sp: Spot) => sp.tags.reduce((acc, tag) => acc + ((tagPriority.indexOf(tag) + 1) || 99), 0);
+        const score = (sp: Spot) =>
+          sp.tags.reduce((acc, tag) => acc + ((tagPriority.indexOf(tag) + 1) || 99), 0);
         return score(a) - score(b);
       });
 
@@ -118,10 +120,14 @@ function generateItinerary(spots: Spot[], days: number, includeThemePark: boolea
           cur.push({ ...s, duration: lbl });
           hours += h;
         } else {
-          const pts = cur.filter(x => typeof x.lat === 'number' && typeof x.lng === 'number') as Required<Spot>[];
+          const pts = cur.filter(
+            x => typeof x.lat === 'number' && typeof x.lng === 'number'
+          ) as Required<Spot>[];
           const centroid = pts.length
-            ? { lat: pts.reduce((a, p) => a + (p.lat as number), 0) / pts.length,
-                lng: pts.reduce((a, p) => a + (p.lng as number), 0) / pts.length }
+            ? {
+                lat: pts.reduce((a, p) => a + (p.lat as number), 0) / pts.length,
+                lng: pts.reduce((a, p) => a + (p.lng as number), 0) / pts.length,
+              }
             : undefined;
           dailyBundles.push({ city: cur[0]?.city || 'unknown', spots: cur, hours, centroid });
           cur = [{ ...s, duration: lbl }];
@@ -130,10 +136,14 @@ function generateItinerary(spots: Spot[], days: number, includeThemePark: boolea
       }
 
       if (cur.length) {
-        const pts = cur.filter(x => typeof x.lat === 'number' && typeof x.lng === 'number') as Required<Spot>[];
+        const pts = cur.filter(
+          x => typeof x.lat === 'number' && typeof x.lng === 'number'
+        ) as Required<Spot>[];
         const centroid = pts.length
-          ? { lat: pts.reduce((a, p) => a + (p.lat as number), 0) / pts.length,
-              lng: pts.reduce((a, p) => a + (p.lng as number), 0) / pts.length }
+          ? {
+              lat: pts.reduce((a, p) => a + (p.lat as number), 0) / pts.length,
+              lng: pts.reduce((a, p) => a + (p.lng as number), 0) / pts.length,
+            }
           : undefined;
         dailyBundles.push({ city: cur[0]?.city || 'unknown', spots: cur, hours, centroid });
       }
@@ -148,14 +158,18 @@ function generateItinerary(spots: Spot[], days: number, includeThemePark: boolea
     if (!B) { merged.push(A); break; }
     const travel = travelHours(A.centroid, B.centroid);
     if (A.hours + travel + B.hours <= maxHoursPerDay) {
-      const spots = [...A.spots, ...B.spots];
+      const spotsMerged = [...A.spots, ...B.spots];
       const hours = A.hours + B.hours + travel;
-      const pts = spots.filter(x => typeof x.lat === 'number' && typeof x.lng === 'number') as Required<Spot>[];
+      const pts = spotsMerged.filter(
+        x => typeof x.lat === 'number' && typeof x.lng === 'number'
+      ) as Required<Spot>[];
       const centroid = pts.length
-        ? { lat: pts.reduce((a, p) => a + (p.lat as number), 0) / pts.length,
-            lng: pts.reduce((a, p) => a + (p.lng as number), 0) / pts.length }
+        ? {
+            lat: pts.reduce((a, p) => a + (p.lat as number), 0) / pts.length,
+            lng: pts.reduce((a, p) => a + (p.lng as number), 0) / pts.length,
+          }
         : A.centroid || B.centroid;
-      merged.push({ city: `${A.city} + ${B.city}`, spots, hours, centroid });
+      merged.push({ city: `${A.city} + ${B.city}`, spots: spotsMerged, hours, centroid });
       i++; // skip B
     } else {
       merged.push(A);
@@ -205,10 +219,10 @@ export default function SummaryPage() {
     const rawNames = searchParams.get('spots') || '';
     const spotNames = rawNames.split(',').map(s => s.trim()).filter(Boolean);
 
-    // if user didn't select any, we could default to all; keep your current behavior (selected only)
+    // If user didn't select any, keep behavior: selected-only
     const selectedSpots = regionSpots.filter((s: Spot) => spotNames.includes(s.name));
 
-    // clamp days to sensible bounds; default to region defaultDays
+    // Clamp days to sensible bounds; default to region defaultDays
     const defaultDays = regionInfo.defaultDays ?? 3;
     const parsed = Number(searchParams.get('days'));
     const clampedDays = Number.isFinite(parsed) ? Math.min(10, Math.max(1, parsed)) : defaultDays;
@@ -221,11 +235,10 @@ export default function SummaryPage() {
   }, [regionInfo, router, searchParams]);
 
   const addOneDay = () => setDays(d => Math.min(10, d + 1));
-const subOneDay = () => setDays(d => Math.max(1, d - 1));
-;
+  // removed unused subOneDay
 
   return (
-    <main className="min-h-screen bg-neutral-950 text-white p-6 font-dm">
+    <main className="min-h-screen bg-neutral-950 text-white p-6 font-sans">
       <div className="max-w-4xl mx-auto">
         <h1 className="text-3xl font-bold mb-4 text-center">🗺️ {regionInfo?.label ?? region?.toUpperCase()} Trip Summary</h1>
 
