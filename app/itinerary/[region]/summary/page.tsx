@@ -220,7 +220,9 @@ export default function SummaryPage() {
     setIncludeThemePark(themeToggle);
   }, [regionInfo, router, searchParams]);
 
-  const addOneDay = () => setDays(d => Math.min(10, d + 1)));
+  const addOneDay = () => setDays(d => Math.min(10, d + 1));
+const subOneDay = () => setDays(d => Math.max(1, d - 1));
+;
 
   return (
     <main className="min-h-screen bg-neutral-950 text-white p-6 font-dm">

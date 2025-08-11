@@ -13,22 +13,27 @@ type Spot = {
   lng?: number;
   tags?: string[];
   image?: string;         // photo URL (user-provided or stock)
-  description?: string;   // printable description
 };
 
-type ItineraryDay = {
-  day: number; // 1-based label, we will renumber on save
-  title?: string;
-  notes?: string;
-  spots: Spot[];
+type PlanItem = Spot & {
+  day: number;            // day index (1..N)
+  order: number;          // order within the day
+  duration: string;       // '1–2 hrs' or '2–3 hrs'
 };
 
-type ItinerarySave = {
+type Plan = {
   region: string;
-  totalDays: number;
-  themeDayReserved: boolean;
-  themeParkName?: string;
-  days: ItineraryDay[];
+  days: number;
+  includeThemePark?: boolean;
+  items: PlanItem[];
+  updatedAt: string;
+};
+
+type SummaryPayload = {
+  region: string;
+  days: number;
+  includeThemePark?: boolean;
+  clusters: { day: number; spots: (Spot & { duration: string })[] }[];
 };
 
 // ===== Storage Keys =====
@@ -207,17 +212,7 @@ const DESCRIPTIONS: Record<string, string> = {
 "Pinaisara Falls (Iriomote)": "Okinawa’s tallest waterfall—jungle trek/ kayak combo to a clifftop plunge and pool.",
 };
 
-// String normalizer for description/alias lookup
-const normalize = (s: string) =>
-  s
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .trim();
-
-// Canonicalization map: common variants ➜ curated display names
-// (Aliases sorted A→Z within each region block)
+// Alias resolver for free-typed searches
 const ALIASES: Record<string, string> = {
   // --- Kansai (A→Z) ---
   "arashiyama bamboo forest": "Arashiyama Bamboo Grove",
@@ -429,269 +424,139 @@ const ALIASES: Record<string, string> = {
 "taketomi": "Taketomi Village",
 };
 
-export { DESCRIPTIONS, ALIASES, normalize };
+const normalize = (s: string) =>
+  s
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 
-
-function fallbackStockImage(spot: Spot, region: string) {
-  const q = encodeURIComponent(`${spot.name} ${spot.city || region} Japan`);
-  // Unsplash source for quick stock preview (replace with your CDN later if preferred)
-  return `https://source.unsplash.com/1200x800/?${q}`;
-}
-
-function genericDescribe(spot: Spot, region: string) {
-  const parts: string[] = [];
-  parts.push(`${spot.name} in ${spot.city || region}`);
-  if (spot.tags?.length) parts.push(`— ${spot.tags.slice(0, 3).join(" / ")}`);
-  parts.push("Expect a comfortable pace (1–3 hrs). Consider booking ahead if needed.");
-  return parts.join(" ");
-}
-
-function getDescriptionFor(spot: Spot, region: string) {
-  // Exact key
-  if (DESCRIPTIONS[spot.name]) return DESCRIPTIONS[spot.name];
-  // Alias lookup on normalized name
-  const norm = normalize(spot.name);
-  const aliasKey = ALIASES[norm];
-  if (aliasKey && DESCRIPTIONS[aliasKey]) return DESCRIPTIONS[aliasKey];
-  // Fallback
-  return genericDescribe(spot, region);
-}
-
-// Heuristic to detect generic fallback so we can prefer curated text at render time
-const looksGenericDesc = (t?: string) => {
-  if (!t) return true;
-  const s = t.trim();
-  return s.length < 30 || /expect a comfortable pace/i.test(s);
+// ===== Utils =====
+const readJSON = <T,>(key: string): T | null => {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as T) : null;
+  } catch {
+    return null;
+  }
 };
 
+const writeJSON = (key: string, value: any) => {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {
+    console.error("localStorage write failed", e);
+  }
+};
+
+// ===== Component =====
 export default function PlanPage() {
-  const { region } = useParams<{ region: string }>();
-  const searchParams = useSearchParams();
+  const params = useParams();
   const router = useRouter();
+  const searchParams = useSearchParams();
 
-  const [plan, setPlan] = useState<ItinerarySave | null>(null);
+  const region = (params?.region as string) ?? "kansai";
+  const [plan, setPlan] = useState<Plan | null>(null);
   const [loading, setLoading] = useState(true);
-  const [dirty, setDirty] = useState(false);
   const [copied, setCopied] = useState<"" | "copied" | "shared">("");
-  const [useStock, setUseStock] = useState<boolean>(true);
 
-  // ===== Load from localStorage or URL (?data=...)
+  // pull summary (from previous step) for fallbacks
+  const summary = useMemo(() => {
+    return readJSON<SummaryPayload>(SUMMARY_KEY(region));
+  }, [region]);
+
   useEffect(() => {
-    if (!region) return;
-    try {
-      const query = searchParams?.get("data");
-      if (query) {
-        const fromQuery = JSON.parse(decodeURIComponent(query)) as ItinerarySave;
-        fromQuery.days = fromQuery.days.map((d, i) => ({ ...d, day: i + 1 }));
-        localStorage.setItem(PLAN_KEY(region), JSON.stringify(fromQuery));
-        setPlan(fromQuery);
-        setLoading(false);
-        return;
-      }
-
-      const raw = localStorage.getItem(PLAN_KEY(region));
-      const fall = localStorage.getItem(SUMMARY_KEY(region));
-      const data: ItinerarySave | null = raw ? JSON.parse(raw) : fall ? JSON.parse(fall) : null;
-      if (data) {
-        data.days = data.days.map((d, idx) => ({ ...d, day: idx + 1 }));
-        setPlan(data);
-      }
-    } catch (e) {
-      console.error("Failed to parse plan:", e);
-    } finally {
+    // existing plan or create from summary
+    const existing = readJSON<Plan>(PLAN_KEY(region));
+    if (existing) {
+      setPlan(existing);
       setLoading(false);
+      return;
     }
-  }, [region, searchParams]);
 
-  // ===== Helpers =====
-  const canSave = useMemo(() => !!plan && dirty, [plan, dirty]);
-
-  function persist(next: ItinerarySave) {
-    if (!region) return;
-    localStorage.setItem(PLAN_KEY(region), JSON.stringify(next));
-  }
-
-  function markDirty(updater: (prev: ItinerarySave) => ItinerarySave) {
-    setPlan(prev => {
-      if (!prev) return prev;
-      const next = updater(prev);
-      setDirty(true);
-      return next;
-    });
-  }
-
-  // ===== Mutations =====
-  function moveDay(index: number, direction: "up" | "down") {
-    markDirty(prev => {
-      const days = [...prev.days];
-      const swapWith = direction === "up" ? index - 1 : index + 1;
-      if (swapWith < 0 || swapWith >= days.length) return prev;
-      [days[index], days[swapWith]] = [days[swapWith], days[index]];
-      const relabeled = days.map((d, i) => ({ ...d, day: i + 1 }));
-      const next = { ...prev, days: relabeled };
-      persist(next);
-      return next;
-    });
-  }
-
-  function moveSpot(dayIdx: number, spotIdx: number, direction: "up" | "down") {
-    markDirty(prev => {
-      const days = prev.days.map(d => ({ ...d, spots: [...d.spots] }));
-      const spots = days[dayIdx].spots;
-      const swapWith = direction === "up" ? spotIdx - 1 : spotIdx + 1;
-      if (swapWith < 0 || swapWith >= spots.length) return prev;
-      [spots[spotIdx], spots[swapWith]] = [spots[swapWith], spots[spotIdx]];
-      const next = { ...prev, days };
-      persist(next);
-      return next;
-    });
-  }
-
-  function moveSpotToDay(fromDayIdx: number, spotIdx: number, toDayIdx: number) {
-    if (toDayIdx === fromDayIdx) return;
-    markDirty(prev => {
-      const days = prev.days.map(d => ({ ...d, spots: [...d.spots] }));
-      const [sp] = days[fromDayIdx].spots.splice(spotIdx, 1);
-      days[toDayIdx].spots.push(sp);
-      const next = { ...prev, days };
-      persist(next);
-      return next;
-    });
-  }
-
-  function removeSpot(dayIdx: number, spotIdx: number) {
-    markDirty(prev => {
-      const days = prev.days.map(d => ({ ...d, spots: [...d.spots] }));
-      days[dayIdx].spots.splice(spotIdx, 1);
-      const next = { ...prev, days };
-      persist(next);
-      return next;
-    });
-  }
-
-  function updateDayTitle(index: number, title: string) {
-    markDirty(prev => {
-      const days = [...prev.days];
-      days[index] = { ...days[index], title };
-      const next = { ...prev, days };
-      persist(next);
-      return next;
-    });
-  }
-
-  function updateDayNotes(index: number, notes: string) {
-    markDirty(prev => {
-      const days = [...prev.days];
-      days[index] = { ...days[index], notes };
-      const next = { ...prev, days };
-      persist(next);
-      return next;
-    });
-  }
-
-  function updateSpotImage(dayIdx: number, spotIdx: number, image: string) {
-    markDirty(prev => {
-      const days = prev.days.map(d => ({ ...d, spots: d.spots.map(s => ({ ...s })) }));
-      days[dayIdx].spots[spotIdx].image = image;
-      const next = { ...prev, days };
-      persist(next);
-      return next;
-    });
-  }
-
-  function updateSpotDescription(dayIdx: number, spotIdx: number, description: string) {
-    markDirty(prev => {
-      const days = prev.days.map(d => ({ ...d, spots: d.spots.map(s => ({ ...s })) }));
-      days[dayIdx].spots[spotIdx].description = description;
-      const next = { ...prev, days };
-      persist(next);
-      return next;
-    });
-  }
-
-  // Prefer curated descriptions; overwrite generic ones when detected
-  function autofillDescriptions() {
-    if (!plan || !region) return;
-    markDirty(prev => {
-      const days = prev.days.map(d => ({
-        ...d,
-        spots: d.spots.map(s => {
-          const current = s.description?.trim() ?? "";
-          const looksGeneric = /Expect a comfortable pace/.test(current) || current.length < 30;
-          const curated = getDescriptionFor(s, prev.region);
-          const nextDesc = current && !looksGeneric ? current : curated;
-          return { ...s, description: nextDesc };
-        })
-      }));
-      const next = { ...prev, days };
-      persist(next);
-      return next;
-    });
-  }
-
-  function applyStockImages() {
-    if (!plan || !region) return;
-    markDirty(prev => {
-      const days = prev.days.map(d => ({
-        ...d,
-        spots: d.spots.map(s => ({
-          ...s,
-          image: s.image && s.image.trim().length > 0 ? s.image : fallbackStockImage(s, prev.region)
-        }))
-      }));
-      const next = { ...prev, days };
-      persist(next);
-      return next;
-    });
-  }
-
-  function savePlan() {
-    if (!plan || !region) return;
-    const relabeled = { ...plan, days: plan.days.map((d, i) => ({ ...d, day: i + 1 })) };
-    persist(relabeled);
-    setPlan(relabeled);
-    setDirty(false);
-  }
-
-  function resetFromSummary() {
-    if (!region) return;
-    const summaryRaw = localStorage.getItem(SUMMARY_KEY(region));
-    if (!summaryRaw) return;
-    const base = JSON.parse(summaryRaw) as ItinerarySave;
-    base.days = base.days.map((d, i) => ({ ...d, day: i + 1 }));
-    localStorage.setItem(PLAN_KEY(region), JSON.stringify(base));
-    setPlan(base);
-    setDirty(false);
-  }
-
-  // ===== Export & Share =====
-  function exportPDF() {
-    window.print(); // Print-to-PDF with clean print styles below
-  }
-
-  async function shareLink() {
-    if (!plan || !region) return;
-    const data = encodeURIComponent(JSON.stringify(plan));
-    const url = `${window.location.origin}/itinerary/${region}/plan?data=${data}`;
-
-    try {
-      if (navigator.share) {
-        await navigator.share({ title: `Trip plan: ${String(region).toUpperCase()}`, url });
-        setCopied("shared");
-        setTimeout(() => setCopied(""), 1500);
-        return;
+    if (summary) {
+      const items: PlanItem[] = [];
+      for (const cluster of summary.clusters) {
+        cluster.spots.forEach((s, i) => {
+          items.push({
+            ...s,
+            day: cluster.day,
+            order: i + 1,
+            duration: s.duration ?? (s.tags?.includes("Iconic") || s.tags?.includes("Cultural") ? "2–3 hrs" : "1–2 hrs"),
+          });
+        });
       }
-    } catch (_) {}
-
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopied("copied");
-      setTimeout(() => setCopied(""), 1500);
-    } catch (e) {
-      console.error("Clipboard failed:", e);
-      alert(url); // fallback
+      const fresh: Plan = {
+        region: summary.region,
+        days: summary.days,
+        includeThemePark: summary.includeThemePark,
+        items,
+        updatedAt: new Date().toISOString(),
+      };
+      setPlan(fresh);
+      writeJSON(PLAN_KEY(region), fresh);
     }
-  }
+    setLoading(false);
+  }, [region, summary]);
+
+  // Reorder helpers
+  const moveItem = (day: number, index: number, dir: -1 | 1) => {
+    if (!plan) return;
+    const items = [...plan.items];
+    const dayItems = items.filter((it) => it.day === day);
+    const src = dayItems[index];
+    const dst = dayItems[index + dir];
+    if (!src || !dst) return;
+
+    const srcGlobal = items.findIndex((it) => it.day === day && it.order === src.order);
+    const dstGlobal = items.findIndex((it) => it.day === day && it.order === dst.order);
+
+    // swap orders
+    items[srcGlobal] = { ...items[srcGlobal], order: dst.order };
+    items[dstGlobal] = { ...items[dstGlobal], order: src.order };
+
+    const normalized = items
+      .sort((a, b) => (a.day === b.day ? a.order - b.order : a.day - b.day))
+      .map((it, i) => ({ ...it }));
+
+    const updated: Plan = { ...plan, items: normalized, updatedAt: new Date().toISOString() };
+    setPlan(updated);
+    writeJSON(PLAN_KEY(region), updated);
+  };
+
+  // Save
+  const canSave = !!plan;
+  const savePlan = () => {
+    if (!plan) return;
+    const updated: Plan = { ...plan, updatedAt: new Date().toISOString() };
+    setPlan(updated);
+    writeJSON(PLAN_KEY(region), updated);
+  };
+
+  // Export / Share
+  const exportPDF = () => {
+    window.print();
+  };
+
+  const shareLink = async () => {
+    const url = typeof window !== "undefined" ? window.location.href : "";
+    try {
+      await navigator.share?.({ url, title: `Shinkai Plan — ${region}` });
+      setCopied("shared");
+    } catch {
+      try {
+        await navigator.clipboard.writeText(url);
+        setCopied("copied");
+        setTimeout(() => setCopied(""), 1500);
+      } catch (e) {
+        console.error("Clipboard failed:", e);
+        alert(url);
+      }
+    }
+  };
 
   if (loading) return <div className="p-6 text-white">Loading…</div>;
   if (!plan) return (
@@ -700,183 +565,80 @@ export default function PlanPage() {
       <button
         className="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-xl"
         onClick={() => router.push(`/itinerary/${region}/summary`)}
-      >
-        ← Back to Summary
-      </button>
+      >Build Summary</button>
     </div>
   );
 
+  // Group items by day
+  const byDay: Record<number, PlanItem[]> = {};
+  for (const it of plan.items) {
+    if (!byDay[it.day]) byDay[it.day] = [];
+    byDay[it.day].push(it);
+  }
+  Object.keys(byDay).forEach((k) => byDay[+k].sort((a, b) => a.order - b.order));
+
   return (
-    <main className="min-h-screen bg-neutral-950 text-white p-6 font-dm">
-      {/* Print styles */}
-      <style jsx global>{`
-        @media print {
-          /* A4 page setup with standard margins */
-          @page { size: A4 portrait; margin: 16mm; }
-          html, body { width: 210mm; }
-
-          /* Ensure colors and backgrounds render in print */
-          -webkit-print-color-adjust: exact;
-          print-color-adjust: exact;
-
-          /* Layout tightening for A4 */
-          :root { font-size: 11pt; }
-          .max-w-6xl { max-width: 100% !important; }
-          .print-container { color: #000; padding: 0 !important; margin: 0 !important; }
-          .cover-grid { grid-template-columns: 1fr 1fr !important; gap: 6mm !important; }
-          .spot-grid { grid-template-columns: 1fr 1fr !important; gap: 6mm !important; }
-
-          /* Cards/images keep together, compact spacing */
-          .print-card { break-inside: avoid; page-break-inside: avoid; border: 0.2mm solid #ddd !important; background: #fff !important; padding: 6mm !important; }
-          .print-hero { height: 55mm !important; object-fit: cover !important; }
-          img { page-break-inside: avoid; }
-          h1, h2, h3 { break-after: avoid-page; }
-
-          /* Hide UI controls */
-          .no-print { display: none !important; }
-          .print-cover { page-break-after: always; }
-        }
-      `}</style>
-
-      <div className="max-w-6xl mx-auto print-container">
-        {/* Cover page */}
-        <section className="rounded-3xl bg-gradient-to-br from-indigo-600 to-purple-600 p-8 text-white shadow-xl print-card print-cover">
-          <h1 className="text-4xl font-extrabold tracking-tight">{String(region).toUpperCase()} – Professional Itinerary</h1>
-          <p className="mt-2 text-white/90">{plan.totalDays} days • {plan.themeDayReserved ? "includes theme park" : "no theme park day"}</p>
-          <div className="cover-grid mt-6 grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {plan.days.slice(0, 6).map((d, i) => {
-              const hero = d.spots.find(s => s.image)?.image || (useStock ? fallbackStockImage(d.spots[0] || { name: region as string, city: String(region) }, plan.region) : undefined);
-              return (
-                <div key={i} className="rounded-2xl overflow-hidden bg-white/10 backdrop-blur border border-white/20">
-                  {hero && <img src={hero} alt="cover" className="w-full h-40 object-cover" />}
-                  <div className="p-3">
-                    <div className="text-sm text-white/80">Day {d.day}</div>
-                    <div className="font-semibold">{d.title || d.spots[0]?.city || "Day Plan"}</div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
-
-        {/* Toolbar */}
-        <div className="flex items-start justify-between gap-4 flex-wrap no-print mt-6">
-          <div>
-            <h2 className="text-2xl font-bold">Planner</h2>
-            <p className="text-sm text-neutral-400 mt-1">Add images & descriptions for a Canva‑style export.</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <label className="flex items-center gap-2 px-3 py-2 rounded-xl border border-neutral-700 bg-neutral-900">
-              <input type="checkbox" checked={useStock} onChange={(e) => setUseStock(e.target.checked)} />
-              <span className="text-sm">Use stock images</span>
-            </label>
-            <button onClick={applyStockImages} className="px-4 py-2 rounded-xl bg-neutral-800 border border-neutral-700 hover:bg-neutral-700">Auto‑fill Images</button>
-            <button onClick={autofillDescriptions} className="px-4 py-2 rounded-xl bg-neutral-800 border border-neutral-700 hover:bg-neutral-700">Auto‑fill Descriptions</button>
-            <button onClick={resetFromSummary} className="px-4 py-2 rounded-xl border border-neutral-700 hover:bg-neutral-900" title="Reload the original summary layout">Reset</button>
-            <button disabled={!canSave} onClick={savePlan} className={`px-4 py-2 rounded-xl ${canSave ? "bg-emerald-600 hover:bg-emerald-700" : "bg-neutral-700 cursor-not-allowed"}`} title={canSave ? "Save your latest edits" : "No changes to save"}>Save</button>
-            <button onClick={exportPDF} className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700" title="Export to PDF via browser print">Export PDF</button>
-            <button onClick={shareLink} className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700" title="Copy or share a link to this plan">{copied === "copied" ? "Copied!" : copied === "shared" ? "Shared!" : "Share Link"}</button>
-          </div>
+    <main className="min-h-screen bg-neutral-950 text-white p-6 font-sans">
+      <div className="max-w-4xl mx-auto">
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl sm:text-3xl font-semibold">{region.toUpperCase()} Itinerary Plan</h1>
+          <div className="text-sm text-white/60">Last updated {new Date(plan.updatedAt).toLocaleString()}</div>
         </div>
 
-        {/* Days (editable + print‑ready) */}
-        <div className="mt-6 space-y-8">
-          {plan.days.map((day, i) => (
-            <section key={i} className="rounded-3xl border border-neutral-800 bg-neutral-900 p-5 print-card">
-              <div className="flex items-start justify-between gap-3 flex-wrap">
-                <div className="flex-1 min-w-[240px]">
-                  <div className="text-sm text-neutral-400">Day {i + 1}</div>
-                  <input
-                    value={day.title ?? ""}
-                    onChange={(e) => updateDayTitle(i, e.target.value)}
-                    placeholder="Add a title (e.g., Kyoto Icons)"
-                    className="mt-1 w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2 text-white placeholder-neutral-500"
-                  />
-                </div>
-                <div className="flex gap-2 no-print">
-                  <button onClick={() => moveDay(i, "up")} className="px-3 py-2 rounded-lg bg-neutral-800 border border-neutral-700 hover:bg-neutral-700">↑ Day</button>
-                  <button onClick={() => moveDay(i, "down")} className="px-3 py-2 rounded-lg bg-neutral-800 border border-neutral-700 hover:bg-neutral-700">↓ Day</button>
-                </div>
-              </div>
-
-              <textarea
-                value={day.notes ?? ""}
-                onChange={(e) => updateDayNotes(i, e.target.value)}
-                placeholder="Notes for this day… lunch plans, parking, weather backups, etc."
-                className="mt-3 w-full rounded-lg bg-neutral-800 border border-neutral-700 px-3 py-2 text-sm text-white placeholder-neutral-500"
-              />
-
-              {/* Spots — now with image + description */}
-              <ul className="spot-grid mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
-                {day.spots.map((s, j) => {
-                  const hero = s.image || (useStock ? fallbackStockImage(s, plan.region) : undefined);
-                  const desc = s.description ?? "";
-                  const curated = getDescriptionFor(s, plan.region);
-                  const displayDesc = desc && !looksGenericDesc(desc) ? desc : curated;
-                  return (
-                    <li key={`${s.name}-${j}`} className="rounded-2xl bg-neutral-800 border border-neutral-700 overflow-hidden">
-                      {hero && (<img src={hero} alt={s.name} className="w-full h-48 object-cover print-hero" />)}
-                      <div className="p-3">
-                        <div className="flex items-start justify-between gap-3 flex-wrap">
-                          <div className="min-w-[220px]">
-                            <div className="font-semibold text-white">{s.name}</div>
-                            <div className="text-xs text-neutral-400">{s.city}{s.duration ? ` • ${s.duration}` : ""}</div>
-                          </div>
-                          <div className="flex items-center gap-2 no-print">
-                            <button onClick={() => moveSpot(i, j, "up")} className="px-2 py-1 rounded-lg border border-neutral-700 bg-neutral-900 hover:bg-neutral-800 text-sm">↑</button>
-                            <button onClick={() => moveSpot(i, j, "down")} className="px-2 py-1 rounded-lg border border-neutral-700 bg-neutral-900 hover:bg-neutral-800 text-sm">↓</button>
-                            <select
-                              className="px-2 py-1 rounded-lg border border-neutral-700 bg-neutral-900 text-sm"
-                              value={i}
-                              onChange={(e) => moveSpotToDay(i, j, parseInt(e.target.value, 10))}
-                              title="Move to day"
-                            >
-                              {plan.days.map((_, idx) => (
-                                <option value={idx} key={`dopt-${idx}`}>Day {idx + 1}</option>
-                              ))}
-                            </select>
-                            <button onClick={() => removeSpot(i, j)} className="px-2 py-1 rounded-lg border border-red-700 bg-red-900/30 hover:bg-red-900/50 text-sm text-red-200">Remove</button>
-                          </div>
+        {/* Days */}
+        <div className="mt-6 space-y-8 print:space-y-4">
+          {Array.from({ length: plan.days }).map((_, dayIdx) => {
+            const day = dayIdx + 1;
+            const items = byDay[day] ?? [];
+            return (
+              <section key={day} className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur-md p-4 shadow">
+                <h2 className="text-lg font-semibold mb-3">Day {day}</h2>
+                {items.length === 0 ? (
+                  <div className="text-white/70">No spots for this day. Use the Summary step to add clustered spots.</div>
+                ) : (
+                  <ol className="space-y-3">
+                    {items.map((it, i) => (
+                      <li key={`${it.name}-${i}`} className="flex items-center gap-3">
+                        <div className="text-white/60 w-6 text-right">{i + 1}.</div>
+                        <div className="flex-1">
+                          <div className="font-medium">{it.name}</div>
+                          <div className="text-sm text-white/70">{it.city} • {it.duration}</div>
+                          {DESCRIPTIONS[it.name] && (
+                            <div className="text-xs text-white/60 mt-1">{DESCRIPTIONS[it.name]}</div>
+                          )}
                         </div>
-
-                        {/* Editable controls (screen only) */}
-                        <div className="no-print mt-3 space-y-2">
-                          <input
-                            value={s.image ?? ""}
-                            onChange={(e) => updateSpotImage(i, j, e.target.value)}
-                            placeholder="Paste image URL (JPG/PNG)"
-                            className="w-full rounded-lg bg-neutral-900 border border-neutral-700 px-3 py-2 text-sm text-white placeholder-neutral-500"
-                          />
-                          <textarea
-                            value={desc}
-                            onChange={(e) => updateSpotDescription(i, j, e.target.value)}
-                            placeholder={curated}
-                            className="w-full rounded-lg bg-neutral-900 border border-neutral-700 px-3 py-2 text-sm text-white placeholder-neutral-500"
-                          />
+                        <div className="flex gap-1 no-print">
+                          <button
+                            className="px-2 py-1 rounded-md bg-neutral-700 hover:bg-neutral-600"
+                            onClick={() => moveItem(day, i, -1)}
+                          >↑</button>
+                          <button
+                            className="px-2 py-1 rounded-md bg-neutral-700 hover:bg-neutral-600"
+                            onClick={() => moveItem(day, i, 1)}
+                          >↓</button>
                         </div>
-
-                        {/* Print description */}
-                        {displayDesc && (
-                          <p className="mt-3 text-sm text-neutral-300">
-                            {displayDesc}
-                          </p>
-                        )}
-                      </div>
-                    </li>
-                  );
-                })}
-              </ul>
-            </section>
-          ))}
+                      </li>
+                    ))}
+                  </ol>
+                )}
+              </section>
+            );
+          })}
         </div>
 
         {/* Footer actions */}
         <div className="flex items-center justify-between mt-8 no-print">
-          <button onClick={() => router.push(`/itinerary/${region}/summary`)} className="text-sm underline text-neutral-400 hover:text-white">← Back to Summary</button>
+          <button
+            onClick={() => router.push(`/itinerary/${region}/summary`)}
+            className="px-4 py-2 rounded-xl bg-neutral-800 hover:bg-neutral-700 text-neutral-200"
+          >← Back to Summary</button>
           <div className="flex gap-2">
             <button onClick={exportPDF} className="px-4 py-2 rounded-xl bg-blue-600 hover:bg-blue-700">Export PDF</button>
-            <button onClick={shareLink} className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700">{copied === "copied" ? "Copied!" : copied === "shared" ? "Shared!" : "Share Link"}</button>
-            <button disabled={!canSave} onClick={savePlan} className={`px-5 py-3 rounded-xl ${canSave ? "bg-emerald-600 hover:bg-emerald-700" : "bg-neutral-700 cursor-not-allowed"}`}>Save Changes</button>
+            <button onClick={shareLink} className="px-4 py-2 rounded-xl bg-neutral-800 hover:bg-neutral-700">
+              {copied === "copied" ? "Copied!" : copied === "shared" ? "Shared!" : "Share Link"}
+            </button>
+            <button disabled={!canSave} onClick={savePlan} className={`px-4 py-2 rounded-xl ${canSave ? "bg-green-600 hover:bg-green-700" : "bg-neutral-700 cursor-not-allowed"}`}>Save Changes</button>
           </div>
         </div>
       </div>
