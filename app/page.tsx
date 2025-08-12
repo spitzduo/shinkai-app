@@ -31,14 +31,7 @@ export default function HomePage() {
             href="/seasons"
             className="rounded-xl text-lg py-3 px-6 bg-white text-neutral-900 hover:bg-neutral-200 active:bg-neutral-300 shadow focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
           >
-            🌸 Seasonal Highlights
-          </Link>
-
-          <Link
-            href="/ryokan"
-            className="rounded-xl text-lg py-3 px-6 bg-white text-neutral-900 hover:bg-neutral-200 active:bg-neutral-300 shadow focus:outline-none focus-visible:ring-2 focus-visible:ring-white/70"
-          >
-            🛏️ Explore Ryokan Stays
+            🛏️ Explore Luxury Ryokan Stays
           </Link>
 
           <Link

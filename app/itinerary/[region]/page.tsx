@@ -34,7 +34,8 @@ export default function RegionPage() {
   const [includeThemePark, setIncludeThemePark] = useState<boolean>(true);
   const [selected, setSelected] = useState<string[]>([]);
 
-  const baseSpots: Spot[] = useMemo(() => regionInfo?.spots ?? [], [regionKey]);
+  const baseSpots: Spot[] = useMemo(() => regionInfo?.spots ?? [], [regionInfo]);
+
 
   const filtered = useMemo(() => {
     const nq = normalize(q);
